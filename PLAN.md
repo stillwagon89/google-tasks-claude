@@ -1,5 +1,9 @@
 # Architecture plan — Google Tasks ↔ Claude, on every surface
 
+> Revised 2026-08-17 against `HISTORY.md` (prior session track record). The
+> revision changes the primary recommendation from "self-host a server" to
+> "connect Composio's existing Google Tasks MCP toolkit" — see below.
+
 ## Diagnosis
 
 The current installer (`install.sh` / `install.ps1`) runs
@@ -12,13 +16,19 @@ layer mismatch. On top of that, Smithery sits as a third-party broker
 between the user and Google — task data and the OAuth grant depend on
 Smithery's hosted server and uptime, not something we control.
 
+`HISTORY.md` confirms this is more than a theory: a `googletasks:*` tool —
+almost certainly this same Smithery listing — worked in two sessions in
+May 2026, then was unreachable in every session since, including direct
+registry searches. Community-hosted MCP registry listings can disappear
+without notice; that is very likely exactly what happened.
+
 ## The fix
 
-Claude supports **custom connectors over remote MCP**: a server we host,
-registered once in the Claude account (claude.ai → Settings → Connectors →
-Add custom connector). Anthropic's cloud reaches that server directly, so
-every surface that authenticates as the user gets it automatically —
-Claude web, Claude Desktop, the Claude mobile apps (added via web, syncs
+Claude supports **custom connectors over remote MCP**: a server, registered
+once in the Claude account (claude.ai → Settings → Connectors → Add custom
+connector). Anthropic's cloud reaches that server directly, so every
+surface that authenticates as the user gets it automatically — Claude web,
+Claude Desktop, the Claude mobile apps (added via web, syncs
 automatically), and Cowork. One registration, one OAuth grant, every
 surface.
 
@@ -29,22 +39,41 @@ it's on the phone, in the Gmail sidebar, and on Calendar. Same mechanism
 that syncs Apple Notes to Reminders on iOS, one layer down: the account's
 own data store, not a bespoke bridge between two apps.
 
+The question is *which* remote MCP server sits behind that connector —
+one we host, or one that already exists.
+
 ## Options weighed
 
 | Option | Verdict |
 |---|---|
-| Smithery-hosted MCP (current) | Reject — Desktop-only by construction, third-party OAuth broker |
-| Zapier / IFTTT bridge | Reject — automations, not conversational read/write |
-| Google Apps Script Web App | Fallback — avoids external hosting, but request limits & cold starts make it secondary |
-| Self-hosted remote MCP connector | **Recommended** — direct to Google Tasks API, one account-level registration covers every Claude surface |
+| Smithery-hosted MCP (current) | Reject — confirmed unreliable by `HISTORY.md`; Desktop-only, community registry listing |
+| Zapier / Pipedream MCP | Maybe — hosted and easy to add, but their Google Tasks actions lean automation-flavored (create/update/list), no confirmed delete |
+| **Composio's Google Tasks MCP** | **Recommended** — purpose-built toolkit, full CRUD, documented Claude Cowork guide, no code or hosting |
+| Self-hosted remote MCP connector | Alternative — full control over the pipe, more setup |
+| Google Apps Script Web App | Fallback only — avoids external hosting, but request limits & cold starts make it secondary |
 
 ## The build
 
-Don't write a Tasks↔MCP bridge from scratch — fork one built for this
-deployment shape:
+### Fast path — Composio's Google Tasks MCP (recommended)
+
+Composio maintains Google Tasks as a first-party toolkit — not a fork we'd
+own — with a documented Claude Cowork integration guide
+(composio.dev/toolkits/googletasks/framework/claude-cowork). Confirmed
+actions include create/delete task, create/delete task list,
+clear-completed, and batch operations; verify list/get/update/complete
+land the same way in their dashboard before relying on read-heavy flows.
+
+Setup: create a Composio account → connect the Google account to the
+Google Tasks toolkit → copy the MCP server URL → add it as a custom
+connector in claude.ai. No Google Cloud project, no hosting, no code.
+
+### Full-control path — self-host instead
+
+Skip unless the priority is nothing sitting between the user and Google
+for this data.
 
 - **ebmurha/google-tasks-mcp** (primary pick) — built specifically for
-  self-host: your own Google Cloud OAuth client, streamable HTTP mode,
+  self-host: own Google Cloud OAuth client, streamable HTTP mode,
   bearer-token or OAuth-gateway auth, a token store you control.
 - **taylorwilsdon/google_workspace_mcp** — broader Workspace coverage
   (Tasks plus Gmail/Calendar/Drive), OAuth 2.1 multi-user, stateless
@@ -60,29 +89,44 @@ the forked project needs a real filesystem for its token store.
 **Auth:** a Google Cloud project the user creates and owns. Enable the
 Tasks API, create a web-application OAuth client, point its redirect URI
 at the deployed server. Left in *Testing* mode with the owner as the only
-test user, it never needs Google's verification review — and unlike the
-Smithery route, credentials are owned end to end.
+test user, it never needs Google's verification review.
 
-**Tool surface** (12 tools): `list_task_lists`, `create_task_list`,
-`delete_task_list`, `list_tasks`, `get_task`, `create_task`,
-`update_task`, `complete_task`, `reopen_task`, `delete_task`, `move_task`,
-`clear_completed`.
+### Tool surface (target shape, either path)
+
+`list_task_lists`, `create_task_list`, `delete_task_list`, `list_tasks`,
+`get_task`, `create_task`, `update_task`, `complete_task`, `reopen_task`,
+`delete_task`, `move_task`, `clear_completed`.
+
+## Known gotchas, carried over from `HISTORY.md`
+
+- **Silent hangs on the list call.** The old `googletasks` tool had
+  `list_task_lists` hang for ~4 minutes with no error, more than once — a
+  bare retry or a disconnect/reconnect in Settings cleared it both times.
+  If this recurs on Composio's server, retry once before treating it as
+  broken.
+- **`tasklist_id`, not `@default`.** `@default` only resolves the actual
+  default list — named/custom lists need the real ID from
+  `list_task_lists` first.
+- **Stale connector URL.** Re-adding a disconnected connector has thrown
+  "server with this URL already exists" before (seen on the Gmail
+  connector, same failure class) — a hard refresh or full logout/login
+  cleared it.
 
 ## Rollout
 
-1. Create the Google Cloud project, enable the Tasks API, generate a
-   web-application OAuth client (Testing mode, owner as sole test user).
-2. Fork `ebmurha/google-tasks-mcp`, wire in the OAuth client, confirm the
-   12 tools above are present, set token storage to something durable.
-3. Deploy to Cloudflare Workers (or Fly.io/Render). Verify the HTTPS
-   endpoint answers the MCP handshake with an MCP inspector before
-   touching Claude.
-4. Register once: claude.ai → Settings → Connectors → Add custom
-   connector → the deployed URL. Complete the Google OAuth consent here.
-5. Confirm on every surface: ask the same question ("what's overdue on my
+1. Connect Google Tasks to Composio (or, full-control path: create the
+   Google Cloud project, enable the Tasks API, generate a web-application
+   OAuth client in Testing mode).
+2. Get the MCP server URL from Composio (or: fork `ebmurha/google-tasks-mcp`,
+   wire in the OAuth client, deploy to Cloudflare Workers, verify the
+   handshake with an MCP inspector).
+3. Register once: claude.ai → Settings → Connectors → Add custom
+   connector → paste the URL. Complete the Google OAuth consent here.
+4. Confirm on every surface: ask the same question ("what's overdue on my
    task lists") from Claude web, Desktop, the phone app, and a Cowork
-   session — no further setup on any of them.
-6. Retire `install.sh` / `install.ps1` and the Smithery instructions —
+   session — no further setup on any of them. Retry once if a list call
+   hangs.
+5. Retire `install.sh` / `install.ps1` and the Smithery instructions —
    superseded, and leaving them risks someone reinstalling the broken
    path.
 
@@ -90,15 +134,17 @@ Smithery route, credentials are owned end to end.
 
 | Concern | Mitigation |
 |---|---|
-| Token expiry | Refresh token stored encrypted at rest; server refreshes the access token itself |
-| Third-party outage | Removed entirely — no Smithery, no broker between user and Google |
-| Server downtime | Workers has no idle "down" state; on Fly.io/Render, enable auto-restart + health check |
-| Quota | Tasks API allows ~50,000 requests/day per project — no realistic ceiling for single-user use |
-| Drift from Google's API | Pin the forked server's dependency versions; re-test all 12 tools before redeploying after any upstream update |
+| Token expiry | Composio refreshes on its side; if self-hosting, store the refresh token encrypted and refresh access tokens server-side |
+| Listing churn (the May 2026 disappearance) | Composio is a maintained product with published docs and framework guides, not a community registry entry — worth a periodic sanity check regardless |
+| Server downtime | Composio's uptime becomes the dependency on the fast path; on the full-control path, enable auto-restart + health check |
+| Quota | Tasks API allows ~50,000 requests/day per project — no realistic ceiling for single-user use, either path |
+| If MCP access stays flaky | **TaskBrief** — a standalone React component from a prior session that authenticates against Google OAuth directly and hands data to the Claude API, bypassing the connector layer entirely. Read-oriented, outside the chat itself, but a real fallback worth reviving if connector reliability doesn't hold up. |
 
 ## Status
 
-This document is the design pass. Building it requires accounts this
-session doesn't have: a Google Cloud project and a hosting account
-(Cloudflare/Fly.io/Render). Once those exist, the fork-and-deploy work in
-"Rollout" steps 1–4 is a single follow-up session.
+This document is the design pass. The fast path (Composio) needs a
+Composio account and a few minutes in claude.ai Settings → Connectors —
+no code from this session. The full-control path additionally needs a
+Google Cloud project and a hosting account. Either way, actually flipping
+the switch in Claude's connector settings is a step only the account owner
+can take.
